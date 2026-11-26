@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>❤ 画一颗爱心 ❤</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  var cvs = document.getElementById("c");
+  var ctx = cvs.getContext("2d");
+  var DPR = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
+  var W, H, CX, CY, SCALE;
+
+  // ============== 可调参数 ==============
+  var MESSAGE = "遇见你,是我最好的运气";
+  var SUBTITLE = "I  ❤  U";
+  var DRAW_FRAMES = 108;   // 描边时长(帧)
+  var SAMPLES = 1200;      // 心形采样点
+  var ANCHORS = 300;       // 终态发光粒子(点)数量
+  var MORPH_FRAMES = 32;   // 画完后"线 -> 粒子"过渡帧数
+  var SHOW_TEXT = true;
+  var Y_MIN = -17, Y_MAX = 12, Y_SPAN = Y_MAX - Y_MIN;
+  // =====================================
+
+  var pts = [];        // 心形屏幕坐标
+  var anchors = [];    // 终态粒子(带向外流光)
+  var dust = [];       // 内部微尘
+  var topY, botY, R;
+  var drawP = 0;       // 描边进度 0..1
+  var phase = "draw";  // draw -> bloom
+  var frame = 0;
+  var bloomFrame = 0;
+  var bloomT = 0;      // 0..1 线 -> 粒子过渡
+  var burst = 0;
+  var emitter = [];
+
+  function heartXY(t) {
+    var x = 16 * Math.pow(Math.sin(t), 3);
+    var y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+    return [x, y];
+  }
+
+  function colorForY(hy) {
+    var f = Math.max(0, Math.min(1, (hy - Y_MIN) / Y_SPAN));
+    var hue = 212 + (335 - 212) * f;   // 下蓝 -> 上粉
+    return [hue, 92, 60 + 12 * f];
+  }
+
+  function easeInOut(p) {
+    return p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+  }
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    cvs.width = Math.floor(W * DPR);
+    cvs.height = Math.floor(H * DPR);
+    cvs.style.width = W + "px";
+    cvs.style.height = H + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    buildGeometry();
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function buildGeometry() {
+    var minhx = 1e9, maxhx = -1e9, minhy = 1e9, maxhy = -1e9, raw = [];
+    for (var i = 0; i < SAMPLES; i++) {
+      var u = i / (SAMPLES - 1);
+      var tt = Math.PI + u * Math.PI * 2;   // 从底部尖角起绕一圈
+      var p = heartXY(tt);
+      raw.push(p);
+      if (p[0] < minhx) minhx = p[0];
+      if (p[0] > maxhx) maxhx = p[0];
+      if (p[1] < minhy) minhy = p[1];
+      if (p[1] > maxhy) maxhy = p[1];
+    }
+    var spanX = maxhx - minhx, spanY = maxhy - minhy;
+    SCALE = Math.min(W * 0.8 / spanX, H * 0.66 / spanY);
+    CX = W / 2;
+    CY = H * 0.44;
+
+    pts = [];
+    topY = 1e9; botY = -1e9;
+    for (var j = 0; j < raw.length; j++) {
+      var x = CX + raw[j][0] * SCALE;
+      var y = CY - raw[j][1] * SCALE;
+      pts.push({ x: x, y: y, hy: raw[j][1] });
+      if (y < topY) topY = y;
+      if (y > botY) botY = y;
+    }
+    R = botY - topY;
+
+    // 终态粒子 + 向外的流光
+    var ccx = CX, ccy = topY + R * 0.46;
+    anchors = [];
+    for (var a = 0; a < ANCHORS; a++) {
+      var idx = Math.floor(a / ANCHORS * pts.length) % pts.length;
+      var pt = pts[idx];
+      var dx = pt.x - ccx, dy = pt.y - ccy;
+      var dl = Math.sqrt(dx * dx + dy * dy) || 1;
+      dx /= dl; dy /= dl;
+
+      var rnd = Math.random();
+      var len;
+      if (rnd < 0.58) len = R * (0.14 + Math.random() * 0.34);
+      else if (rnd < 0.86) len = R * (0.42 + Math.random() * 0.40);
+      else len = R * (0.80 + Math.random() * 0.30);   // 少量超长丝
+
+      var up = (pt.hy - Y_MIN) / Y_SPAN;               // 0 下,1 上
+      var sz = 1.0 + Math.random() * 2.3;
+      if (up > 0.72) sz *= 1.25;                        // 上部更粗更亮(粉色团)
+      if (Math.random() < 0.07) sz *= 1.9;              // 少量大光斑
+
+      anchors.push({
+        x: pt.x, y: pt.y, hy: pt.hy,
+        dx: dx, dy: dy,
+        len: len,
+        w: 0.5 + Math.random() * 1.0,
+        size: sz,
+        bend: (Math.random() - 0.5) * 0.22,             // 流光弯曲
+        phase: Math.random() * Math.PI * 2,
+        sp: 0.03 + Math.random() * 0.08,
+        white: Math.random() < 0.42
+      });
+    }
+
+    // 内部微尘
+    dust = [];
+    for (var d = 0; d < 90; d++) {
+      var tu = Math.random() * Math.PI * 2;
+      var hp = heartXY(tu);
+      var fill = Math.sqrt(Math.random()) * 0.85;
+      dust.push({
+        bx: hp[0] * fill, by: hp[1] * fill,
+        phase: Math.random() * Math.PI * 2,
+        sp: 0.02 + Math.random() * 0.05,
+        size: 0.5 + Math.random() * 1.4
+      });
+    }
+  }
+
+  function clearBlack() {
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function makeGradient() {
+    var g = ctx.createLinearGradient(CX, topY, CX, botY);
+    g.addColorStop(0, "#ff8bd0");
+    g.addColorStop(0.45, "#c07cff");
+    g.addColorStop(1, "#5aa2ff");
+    return g;
+  }
+
+  function drawSoftGlow(x, y, rad, rgb) {
+    var g = ctx.createRadialGradient(x, y, 0, x, y, rad);
+    g.addColorStop(0, "rgba(" + rgb + ",0.55)");
+    g.addColorStop(1, "rgba(" + rgb + ",0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, rad, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function tracePath(u) {
+    var n = Math.floor(u * (pts.length - 1));
+    if (n < 1) n = 1;
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i <= n; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    if (u >= 0.999) ctx.closePath();
+    return n;
+  }
+
+  function drawHeadGlow(x, y) {
+    ctx.shadowColor = "rgba(255,120,210,0.95)";
+    ctx.shadowBlur = 36;
+    ctx.fillStyle = "rgba(255,240,250,1)";
+    ctx.beginPath();
+    ctx.arc(x, y, 4.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+
+  function drawHeadTrail(n) {
+    var back = 46, start = Math.max(0, n - back);
+    for (var i = start; i < n; i++) {
+      var a = (i - start) / (n - start);
+      var p0 = pts[i], p1 = pts[i + 1];
+      ctx.strokeStyle = "rgba(255,235,250," + (0.05 + 0.5 * a) + ")";
+      ctx.lineWidth = 1 + 2.4 * a;
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.stroke();
+    }
+  }
+
+  function updateEmitter() {
+    for (var i = emitter.length - 1; i >= 0; i--) {
+      var e = emitter[i];
+      e.x += e.vx; e.y += e.vy; e.vy += 0.03; e.life -= 0.02;
+      if (e.life <= 0) { emitter.splice(i, 1); continue; }
+      ctx.fillStyle = "rgba(255," + (150 + Math.floor(90 * e.life)) + ",240," + (0.7 * e.life) + ")";
+      ctx.beginPath();
+      ctx.arc(e.x, e.y, e.size * e.life, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawText(alpha) {
+    var big = Math.max(19, Math.min(Math.min(W, H) * 0.05, 38));
+    ctx.save();
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = alpha;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "600 " + big + "px -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif";
+    ctx.shadowColor = "rgba(120,160,255,0.9)";
+    ctx.shadowBlur = 22;
+    ctx.fillStyle = "#ffe0f0";
+    ctx.fillText(MESSAGE, CX, H * 0.885);
+    var small = big * 0.62;
+    ctx.font = "700 " + small + "px -apple-system, 'PingFang SC', sans-serif";
+    ctx.shadowColor = "rgba(255,90,180,0.95)";
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = "#ff85c6";
+    ctx.fillText(SUBTITLE, CX, H * 0.885 + big * 1.25);
+    ctx.restore();
+  }
+
+  // ---------- 阶段1:描边成形 ----------
+  function renderDraw() {
+    clearBlack();
+    var u = easeInOut(drawP);
+    var n = tracePath(u);
+
+    ctx.globalCompositeOperation = "lighter";
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    ctx.shadowColor = "rgba(255,110,200,0.75)";
+    ctx.shadowBlur = 30;
+    ctx.strokeStyle = makeGradient();
+    ctx.globalAlpha = 0.18;
+    ctx.lineWidth = 9;
+    ctx.stroke();
+
+    ctx.shadowBlur = 16;
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    drawHeadTrail(n);
+    var head = pts[Math.min(n, pts.length - 1)];
+    drawHeadGlow(head.x, head.y);
+
+    if (frame % 2 === 0) {
+      emitter.push({
+        x: head.x, y: head.y,
+        vx: (Math.random() - 0.5) * 2.4,
+        vy: (Math.random() - 0.5) * 2.4 - 0.4,
+        life: 1, size: 1 + Math.random() * 2
+      });
+    }
+    updateEmitter();
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- 阶段2:粒子爱心 + 向外流光 + 闪烁 ----------
+  function renderBloom() {
+    clearBlack();
+    ctx.globalCompositeOperation = "lighter";
+    var t = bloomT;
+
+    // 内部柔光
+    var rg = ctx.createRadialGradient(CX, topY + R * 0.45, 8, CX, topY + R * 0.45, R * 0.62);
+    rg.addColorStop(0, "rgba(255,120,200,0.10)");
+    rg.addColorStop(1, "rgba(90,120,255,0)");
+    ctx.globalAlpha = t;
+    ctx.fillStyle = rg;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+
+    // 连续描边随过渡淡出(线 -> 粒子)
+    if (t < 1) {
+      tracePath(1);
+      ctx.strokeStyle = makeGradient();
+      ctx.shadowColor = "rgba(255,110,200,0.8)";
+      ctx.shadowBlur = 24;
+      ctx.globalAlpha = 0.9 * (1 - t);
+      ctx.lineWidth = 3.2;
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = 1;
+    }
+
+    // 整体柔光晕
+    var halo = ctx.createRadialGradient(CX, topY + R * 0.5, R * 0.04, CX, topY + R * 0.5, R * 0.92);
+    halo.addColorStop(0, "rgba(255,130,205,0.10)");
+    halo.addColorStop(0.5, "rgba(150,120,255,0.05)");
+    halo.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.globalAlpha = t;
+    ctx.fillStyle = halo;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+
+    // 粒子 + 流光(整体随 t 淡入)
+    ctx.globalAlpha = Math.min(1, t * 1.4);
+    for (var i = 0; i < anchors.length; i++) {
+      var a = anchors[i];
+      var tw = 0.35 + 0.65 * Math.abs(Math.sin(frame * a.sp + a.phase));
+      var c = colorForY(a.hy);
+
+      // 向外流光丝(带轻微弯曲 + 摆动)
+      var len = a.len * (0.55 + 0.45 * tw);
+      var ex = a.x + a.dx * len;
+      var ey = a.y + a.dy * len;
+      var px = -a.dy, py = a.dx;                         // 垂直方向
+      var bend = (a.bend + 0.06 * Math.sin(frame * a.sp * 1.3 + a.phase)) * len;
+      var mx = a.x + a.dx * len * 0.5 + px * bend;
+      var my = a.y + a.dy * len * 0.5 + py * bend;
+      ctx.strokeStyle = "hsla(" + c[0] + "," + c[1] + "%," + (c[2] + 12) + "%," + (0.09 + 0.45 * tw) + ")";
+      ctx.lineWidth = a.w;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.quadraticCurveTo(mx, my, ex, ey);
+      ctx.stroke();
+
+      // 流光尖端亮点
+      var tipL = a.white ? 95 : Math.min(92, c[2] + 28);
+      ctx.fillStyle = "hsla(" + c[0] + ",90%," + tipL + "%," + (0.45 * tw) + ")";
+      ctx.beginPath();
+      ctx.arc(ex, ey, a.w * 1.05, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 爱心上的发光粒子(外圈淡淡光晕 + 内芯亮)
+      var rad = a.size * (0.6 + 0.5 * tw);
+      ctx.fillStyle = "hsla(" + c[0] + "," + c[1] + "%," + (c[2] + 8) + "%," + (0.14 * tw) + ")";
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, rad * 2.4, 0, Math.PI * 2);
+      ctx.fill();
+
+      var coreL = a.white ? 97 : Math.min(94, c[2] + 26);
+      ctx.fillStyle = "hsla(" + c[0] + ",95%," + coreL + "%," + (0.55 + 0.45 * tw) + ")";
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, rad, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // 关键顶点高光(底部尖角 / 顶部凹陷)
+    ctx.globalAlpha = Math.min(1, t * 1.4);
+    drawSoftGlow(CX, botY, R * 0.16, "255,170,225");
+    drawSoftGlow(CX, topY + R * 0.30, R * 0.12, "255,190,235");
+    ctx.globalAlpha = 1;
+
+    // 内部漂浮微尘
+    ctx.globalAlpha = Math.min(1, t * 1.2);
+    for (var d = 0; d < dust.length; d++) {
+      var du = dust[d];
+      var dx = CX + du.bx * SCALE + Math.sin(frame * du.sp + du.phase) * 3;
+      var dy = CY - du.by * SCALE + Math.cos(frame * du.sp * 0.7 + du.phase) * 3;
+      var tw2 = 0.3 + 0.7 * Math.abs(Math.sin(frame * du.sp + du.phase));
+      ctx.fillStyle = "rgba(190,200,255," + (0.10 + 0.30 * tw2) + ")";
+      ctx.beginPath();
+      ctx.arc(dx, dy, du.size * tw2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // 绽放爆发圈
+    if (burst > 0) {
+      var maxR = R * 0.9;
+      var r = (1 - burst) * maxR;
+      ctx.strokeStyle = "rgba(255,150,220," + (burst * 0.5) + ")";
+      ctx.lineWidth = 3 * burst + 1;
+      ctx.beginPath();
+      ctx.arc(CX, CY, r, 0, Math.PI * 2);
+      ctx.stroke();
+      burst -= 0.022;
+    }
+
+    // 文字淡入
+    if (SHOW_TEXT) {
+      var el = frame - bloomFrame;
+      var alpha = Math.max(0, Math.min(1, (el - 12) / 45));
+      if (alpha > 0) drawText(alpha * (0.7 + 0.3 * Math.abs(Math.sin(frame * 0.03))));
+    }
+  }
+
+  function loop() {
+    frame++;
+    if (phase === "draw") {
+      drawP += 1 / DRAW_FRAMES;
+      if (drawP >= 1) {
+        drawP = 1;
+        phase = "bloom";
+        bloomFrame = frame;
+        bloomT = 0;
+        burst = 1;
+      }
+      renderDraw();
+    } else {
+      if (bloomT < 1) bloomT += 1 / MORPH_FRAMES;
+      if (bloomT > 1) bloomT = 1;
+      renderBloom();
+    }
+    requestAnimationFrame(loop);
+  }
+
+  var resizeTimer = null;
+  window.addEventListener("resize", function () {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 120);
+  });
+
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
